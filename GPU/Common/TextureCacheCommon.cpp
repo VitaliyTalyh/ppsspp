@@ -16,6 +16,7 @@
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
 #include <algorithm>
+#include "profiler/profiler.h"
 #include "Common/ColorConv.h"
 #include "Common/MemoryUtil.h"
 #include "Core/Config.h"
@@ -45,6 +46,10 @@
 #define TEXTURE_KILL_AGE_LOWMEM 60
 // Not used in lowmem mode.
 #define TEXTURE_SECOND_KILL_AGE 100
+// Used when there are multiple CLUT variants of a texture.
+#define TEXTURE_KILL_AGE_CLUT 6
+
+#define TEXTURE_CLUT_VARIANTS_MIN 6
 
 // Try to be prime to other decimation intervals.
 #define TEXCACHE_DECIMATION_INTERVAL 13
@@ -328,6 +333,9 @@ void TextureCacheCommon::SetTexture(bool force) {
 
 	TexCache::iterator iter = cache_.find(cachekey);
 	TexCacheEntry *entry = nullptr;
+
+	// Note: It's necessary to reset needshadertexclamp, for otherwise DIRTY_TEXCLAMP won't get set later.
+	// Should probably revisit how this works..
 	gstate_c.SetNeedShaderTexclamp(false);
 	gstate_c.skipDrawReason &= ~SKIPDRAW_BAD_FB_TEXTURE;
 	if (gstate_c.bgraTexture != isBgraBackend_) {
@@ -379,7 +387,7 @@ void TextureCacheCommon::SetTexture(bool force) {
 					// Exponential backoff up to 512 frames.  Textures are often reused.
 					if (entry->numFrames > 32) {
 						// Also, try to add some "randomness" to avoid rehashing several textures the same frame.
-						entry->framesUntilNextFullHash = std::min(512, entry->numFrames) + (entry->textureName & 15);
+						entry->framesUntilNextFullHash = std::min(512, entry->numFrames) + (((intptr_t)(entry->textureName) >> 12) & 15);
 					} else {
 						entry->framesUntilNextFullHash = entry->numFrames;
 					}
@@ -450,6 +458,24 @@ void TextureCacheCommon::SetTexture(bool force) {
 			entry->status = TexCacheEntry::STATUS_UNRELIABLE;
 		}
 
+		if (hasClut && clutRenderAddress_ == 0xFFFFFFFF) {
+			const u64 cachekeyMin = (u64)(texaddr & 0x3FFFFFFF) << 32;
+			const u64 cachekeyMax = cachekeyMin + (1ULL << 32);
+
+			int found = 0;
+			for (auto it = cache_.lower_bound(cachekeyMin), end = cache_.upper_bound(cachekeyMax); it != end; ++it) {
+				found++;
+			}
+
+			if (found >= TEXTURE_CLUT_VARIANTS_MIN) {
+				for (auto it = cache_.lower_bound(cachekeyMin), end = cache_.upper_bound(cachekeyMax); it != end; ++it) {
+					it->second->status |= TexCacheEntry::STATUS_CLUT_VARIANTS;
+				}
+
+				entry->status |= TexCacheEntry::STATUS_CLUT_VARIANTS;
+			}
+		}
+
 		nextNeedsChange_ = false;
 	}
 
@@ -501,8 +527,10 @@ void TextureCacheCommon::Decimate() {
 		const u32 had = cacheSizeEstimate_;
 
 		ForgetLastTexture();
-		int killAge = lowMemoryMode_ ? TEXTURE_KILL_AGE_LOWMEM : TEXTURE_KILL_AGE;
+		int killAgeBase = lowMemoryMode_ ? TEXTURE_KILL_AGE_LOWMEM : TEXTURE_KILL_AGE;
 		for (TexCache::iterator iter = cache_.begin(); iter != cache_.end(); ) {
+			bool hasClut = (iter->second->status & TexCacheEntry::STATUS_CLUT_VARIANTS) != 0;
+			int killAge = hasClut ? TEXTURE_KILL_AGE_CLUT : killAgeBase;
 			if (iter->second->lastFrame + killAge < gpuStats.numFlips) {
 				DeleteTexture(iter++);
 			} else {
@@ -716,10 +744,6 @@ bool TextureCacheCommon::AttachFramebuffer(TexCacheEntry *entry, u32 address, Vi
 
 	// If they match exactly, it's non-CLUT and from the top left.
 	if (exactMatch) {
-		// Apply to non-buffered and buffered mode only.
-		if (!(g_Config.iRenderingMode == FB_NON_BUFFERED_MODE || g_Config.iRenderingMode == FB_BUFFERED_MODE))
-			return false;
-
 		DEBUG_LOG(G3D, "Render to texture detected at %08x!", address);
 		if (framebuffer->fb_stride != entry->bufw) {
 			WARN_LOG_REPORT_ONCE(diffStrides1, G3D, "Render to texture with different strides %d != %d", entry->bufw, framebuffer->fb_stride);
@@ -836,7 +860,9 @@ void TextureCacheCommon::SetTextureFramebuffer(TexCacheEntry *entry, VirtualFram
 		gstate_c.bgraTexture = false;
 		gstate_c.curTextureXOffset = fbInfo.xOffset;
 		gstate_c.curTextureYOffset = fbInfo.yOffset;
-		gstate_c.SetNeedShaderTexclamp(gstate_c.curTextureWidth != (u32)gstate.getTextureWidth(0) || gstate_c.curTextureHeight != (u32)gstate.getTextureHeight(0));
+		u32 texW = (u32)gstate.getTextureWidth(0);
+		u32 texH = (u32)gstate.getTextureHeight(0);
+		gstate_c.SetNeedShaderTexclamp(gstate_c.curTextureWidth != texW || gstate_c.curTextureHeight != texH);
 		if (gstate_c.curTextureXOffset != 0 || gstate_c.curTextureYOffset != 0) {
 			gstate_c.SetNeedShaderTexclamp(true);
 		}
@@ -905,12 +931,7 @@ void TextureCacheCommon::NotifyConfigChanged() {
 			}
 		}
 
-		// Mobile devices don't get the higher scale factors, too expensive. Very rough way to decide though...
-		if (!gstate_c.Supports(GPU_IS_MOBILE)) {
-			scaleFactor = std::min(5, scaleFactor);
-		} else {
-			scaleFactor = std::min(3, scaleFactor);
-		}
+		scaleFactor = std::min(5, scaleFactor);
 	} else {
 		scaleFactor = g_Config.iTexScalingLevel;
 	}
@@ -1476,6 +1497,7 @@ void TextureCacheCommon::ApplyTexture() {
 		}
 
 		if (nextNeedsRehash_) {
+			PROFILE_THIS_SCOPE("texhash");
 			// Update the hash on the texture.
 			int w = gstate.getTextureWidth(0);
 			int h = gstate.getTextureHeight(0);
@@ -1551,7 +1573,11 @@ void TextureCacheCommon::DeleteTexture(TexCache::iterator it) {
 bool TextureCacheCommon::CheckFullHash(TexCacheEntry *entry, bool &doDelete) {
 	int w = gstate.getTextureWidth(0);
 	int h = gstate.getTextureHeight(0);
-	u32 fullhash = QuickTexHash(replacer_, entry->addr, entry->bufw, w, h, GETextureFormat(entry->format), entry);
+	u32 fullhash;
+	{
+		PROFILE_THIS_SCOPE("texhash");
+		fullhash = QuickTexHash(replacer_, entry->addr, entry->bufw, w, h, GETextureFormat(entry->format), entry);
+	}
 
 	if (fullhash == entry->fullhash) {
 		if (g_Config.bTextureBackoffCache) {

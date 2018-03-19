@@ -208,7 +208,7 @@ bool Delete(const std::string &filename) {
 // Returns true if successful, or path already exists.
 bool CreateDir(const std::string &path)
 {
-	INFO_LOG(COMMON, "CreateDir: directory %s", path.c_str());
+	DEBUG_LOG(COMMON, "CreateDir('%s')", path.c_str());
 #ifdef _WIN32
 	if (::CreateDirectory(ConvertUTF8ToWString(path).c_str(), NULL))
 		return true;
@@ -241,10 +241,9 @@ bool CreateDir(const std::string &path)
 bool CreateFullPath(const std::string &fullPath)
 {
 	int panicCounter = 100;
-	DEBUG_LOG(COMMON, "CreateFullPath: path %s", fullPath.c_str());
+	VERBOSE_LOG(COMMON, "CreateFullPath: path %s", fullPath.c_str());
 		
-	if (File::Exists(fullPath))
-	{
+	if (File::Exists(fullPath)) {
 		DEBUG_LOG(COMMON, "CreateFullPath: path exists %s", fullPath.c_str());
 		return true;
 	}

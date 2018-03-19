@@ -12,6 +12,7 @@
 #include "ui/ui.h"
 #include "ui/view.h"
 #include "ui/ui_context.h"
+#include "ui/ui_tween.h"
 #include "thin3d/thin3d.h"
 #include "base/NativeApp.h"
 
@@ -160,6 +161,24 @@ View::~View() {
 	if (HasFocus())
 		SetFocusedView(0);
 	RemoveQueuedEvents(this);
+
+	// Could use unique_ptr, but then we have to include tween everywhere.
+	for (auto &tween : tweens_)
+		delete tween;
+	tweens_.clear();
+}
+
+void View::Update() {
+	for (size_t i = 0; i < tweens_.size(); ++i) {
+		Tween *tween = tweens_[i];
+		if (!tween->Finished()) {
+			tween->Apply(this);
+		} else if (!tween->Persists()) {
+			tweens_.erase(tweens_.begin() + i);
+			i--;
+			delete tween;
+		}
+	}
 }
 
 void View::Measure(const UIContext &dc, MeasureSpec horiz, MeasureSpec vert) {
@@ -211,6 +230,11 @@ void View::PersistData(PersistStatus status, std::string anonId, PersistMap &sto
 		}
 		break;
 	}
+
+	ITOA stringify;
+	for (int i = 0; i < (int)tweens_.size(); ++i) {
+		tweens_[i]->PersistData(status, tag + "/" + stringify.p((int)i), storage);
+	}
 }
 
 Point View::GetFocusPosition(FocusDirection dir) {
@@ -235,6 +259,28 @@ bool View::SetFocus() {
 		}
 	}
 	return false;
+}
+
+Clickable::Clickable(LayoutParams *layoutParams)
+	: View(layoutParams) {
+	// We set the colors later once we have a UIContext.
+	bgColor_ = AddTween(new CallbackColorTween(0.1f));
+	bgColor_->Persist();
+}
+
+void Clickable::DrawBG(UIContext &dc, const Style &style) {
+	if (style.background.type == DRAW_SOLID_COLOR) {
+		if (time_now() - bgColorLast_ >= 0.25f) {
+			bgColor_->Reset(style.background.color);
+		} else {
+			bgColor_->Divert(style.background.color, down_ ? 0.05f : 0.1f);
+		}
+		bgColorLast_ = time_now();
+
+		dc.FillRect(Drawable(bgColor_->CurrentValue()), bounds_);
+	} else {
+		dc.FillRect(style.background, bounds_);
+	}
 }
 
 void Clickable::Click() {
@@ -427,7 +473,7 @@ ClickableItem::ClickableItem(LayoutParams *layoutParams) : Clickable(layoutParam
 }
 
 void ClickableItem::Draw(UIContext &dc) {
-	Style style =	dc.theme->itemStyle;
+	Style style = dc.theme->itemStyle;
 
 	if (HasFocus()) {
 		style = dc.theme->itemFocusedStyle;
@@ -436,7 +482,7 @@ void ClickableItem::Draw(UIContext &dc) {
 		style = dc.theme->itemDownStyle;
 	}
 
-	dc.FillRect(style.background, bounds_);
+	DrawBG(dc, style);
 }
 
 void Choice::GetContentDimensionsBySpec(const UIContext &dc, MeasureSpec horiz, MeasureSpec vert, float &w, float &h) const {
@@ -478,7 +524,7 @@ void Choice::Draw(UIContext &dc) {
 	if (!IsSticky()) {
 		ClickableItem::Draw(dc);
 	} else {
-		Style style =	dc.theme->itemStyle;
+		Style style = dc.theme->itemStyle;
 		if (highlighted_) {
 			style = dc.theme->itemHighlightedStyle;
 		}
@@ -488,7 +534,8 @@ void Choice::Draw(UIContext &dc) {
 		if (HasFocus()) {
 			style = dc.theme->itemFocusedStyle;
 		}
-		dc.FillRect(style.background, bounds_);
+
+		DrawBG(dc, style);
 	}
 
 	Style style = dc.theme->itemStyle;
@@ -524,11 +571,30 @@ void Choice::Draw(UIContext &dc) {
 	}
 }
 
+InfoItem::InfoItem(const std::string &text, const std::string &rightText, LayoutParams *layoutParams)
+	: Item(layoutParams), text_(text), rightText_(rightText) {
+	// We set the colors later once we have a UIContext.
+	bgColor_ = AddTween(new CallbackColorTween(0.1f));
+	bgColor_->Persist();
+	fgColor_ = AddTween(new CallbackColorTween(0.1f));
+	fgColor_->Persist();
+}
+
 void InfoItem::Draw(UIContext &dc) {
 	Item::Draw(dc);
 
 	UI::Style style = HasFocus() ? dc.theme->itemFocusedStyle : dc.theme->infoStyle;
-	style.background.color &= 0x7fffffff;
+
+	if (style.background.type == DRAW_SOLID_COLOR) {
+		// For a smoother fade, using the same color with 0 alpha.
+		if ((style.background.color & 0xFF000000) == 0)
+			style.background.color = dc.theme->itemFocusedStyle.background.color & 0x00FFFFFF;
+		bgColor_->Divert(style.background.color & 0x7fffffff);
+		style.background.color = bgColor_->CurrentValue();
+	}
+	fgColor_->Divert(style.fgColor);
+	style.fgColor = fgColor_->CurrentValue();
+
 	dc.FillRect(style.background, bounds_);
 
 	int paddingX = 12;
@@ -549,6 +615,19 @@ void ItemHeader::Draw(UIContext &dc) {
 	dc.SetFontStyle(dc.theme->uiFontSmall);
 	dc.DrawText(text_.c_str(), bounds_.x + 4, bounds_.centerY(), dc.theme->headerStyle.fgColor, ALIGN_LEFT | ALIGN_VCENTER);
 	dc.Draw()->DrawImageStretch(dc.theme->whiteImage, bounds_.x, bounds_.y2()-2, bounds_.x2(), bounds_.y2(), dc.theme->headerStyle.fgColor);
+}
+
+void ItemHeader::GetContentDimensionsBySpec(const UIContext &dc, MeasureSpec horiz, MeasureSpec vert, float &w, float &h) const {
+	Bounds bounds(0, 0, layoutParams_->width, layoutParams_->height);
+	if (bounds.w < 0) {
+		// If there's no size, let's grow as big as we want.
+		bounds.w = horiz.size == 0 ? MAX_ITEM_SIZE : horiz.size;
+	}
+	if (bounds.h < 0) {
+		bounds.h = vert.size == 0 ? MAX_ITEM_SIZE : vert.size;
+	}
+	ApplyBoundsBySpec(bounds, horiz, vert);
+	dc.MeasureTextRect(dc.theme->uiFontSmall, 1.0f, 1.0f, text_.c_str(), (int)text_.length(), bounds, &w, &h, ALIGN_LEFT | ALIGN_VCENTER);
 }
 
 void PopupHeader::Draw(UIContext &dc) {
@@ -666,7 +745,7 @@ void Button::Draw(UIContext &dc) {
 	if (!IsEnabled()) style = dc.theme->buttonDisabledStyle;
 
 	// dc.Draw()->DrawImage4Grid(style.image, bounds_.x, bounds_.y, bounds_.x2(), bounds_.y2(), style.bgColor);
-	dc.FillRect(style.background, bounds_);
+	DrawBG(dc, style);
 	float tw, th;
 	dc.MeasureText(dc.theme->uiFont, 1.0f, 1.0f, text_.c_str(), &tw, &th);
 	if (tw > bounds_.w || imageID_ != -1) {
@@ -737,6 +816,10 @@ void TextView::GetContentDimensionsBySpec(const UIContext &dc, MeasureSpec horiz
 }
 
 void TextView::Draw(UIContext &dc) {
+	uint32_t textColor = hasTextColor_ ? textColor_ : dc.theme->infoStyle.fgColor;
+	if (!(textColor & 0xFF000000))
+		return;
+
 	bool clip = false;
 	if (measuredWidth_ > bounds_.w || measuredHeight_ > bounds_.h)
 		clip = true;
@@ -758,9 +841,8 @@ void TextView::Draw(UIContext &dc) {
 	dc.SetFontStyle(small_ ? dc.theme->uiFontSmall : dc.theme->uiFont);
 	if (shadow_) {
 		uint32_t shadowColor = 0x80000000;
-		dc.DrawTextRect(text_.c_str(), bounds_, shadowColor, textAlign_);
+		dc.DrawTextRect(text_.c_str(), bounds_.Offset(1.0f, 1.0f), shadowColor, textAlign_);
 	}
-	uint32_t textColor = hasTextColor_ ? textColor_ : dc.theme->infoStyle.fgColor;
 	dc.DrawTextRect(text_.c_str(), bounds_, textColor, textAlign_);
 	if (clip) {
 		dc.PopScissor();
@@ -992,6 +1074,26 @@ void ProgressBar::Draw(UIContext &dc) {
 	dc.DrawTextRect(temp, bounds_, 0xFFFFFFFF, ALIGN_CENTER);
 }
 
+void Spinner::GetContentDimensions(const UIContext &dc, float &w, float &h) const {
+	w = 48;
+	h = 48;
+}
+
+void Spinner::Draw(UIContext &dc) {
+	if (!(color_ & 0xFF000000))
+		return;
+	double t = time_now_d() * 1.3f;
+	double angle = fmod(t, M_PI * 2.0);
+	float r = bounds_.w * 0.5f;
+	double da = M_PI * 2.0 / numImages_;
+	for (int i = 0; i < numImages_; i++) {
+		double a = angle + i * da;
+		float x = (float)cos(a) * r;
+		float y = (float)sin(a) * r;
+		dc.Draw()->DrawImage(images_[i], bounds_.centerX() + x, bounds_.centerY() + y, 1.0f, color_, ALIGN_CENTER);
+	}
+}
+
 void TriggerButton::Touch(const TouchInput &input) {
 	if (input.flags & TOUCH_DOWN) {
 		if (bounds_.Contains(input.x, input.y)) {
@@ -1119,6 +1221,7 @@ void Slider::Draw(UIContext &dc) {
 }
 
 void Slider::Update() {
+	View::Update();
 	if (repeat_ >= 0) {
 		repeat_++;
 	}
@@ -1228,6 +1331,7 @@ void SliderFloat::Draw(UIContext &dc) {
 }
 
 void SliderFloat::Update() {
+	View::Update();
 	if (repeat_ >= 0) {
 		repeat_++;
 	}

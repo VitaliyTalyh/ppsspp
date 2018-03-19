@@ -237,17 +237,6 @@ bool VKShaderModule::Compile(VulkanContext *vulkan, ShaderLanguage language, con
 	return ok_;
 }
 
-
-inline VkFormat ConvertVertexDataTypeToVk(DataFormat type) {
-	switch (type) {
-	case DataFormat::R32G32_FLOAT: return VK_FORMAT_R32G32_SFLOAT;
-	case DataFormat::R32G32B32_FLOAT: return VK_FORMAT_R32G32B32_SFLOAT;
-	case DataFormat::R32G32B32A32_FLOAT: return VK_FORMAT_R32G32B32A32_SFLOAT;
-	case DataFormat::R8G8B8A8_UNORM: return VK_FORMAT_R8G8B8A8_UNORM;
-	default: return VK_FORMAT_UNDEFINED;
-	}
-}
-
 class VKInputLayout : public InputLayout {
 public:
 	std::vector<VkVertexInputBindingDescription> bindings;
@@ -312,10 +301,10 @@ struct DescriptorSetKey {
 
 class VKTexture : public Texture {
 public:
-	VKTexture(VulkanContext *vulkan, VkCommandBuffer cmd, const TextureDesc &desc, VulkanDeviceAllocator *alloc)
+	VKTexture(VulkanContext *vulkan, VkCommandBuffer cmd, VulkanPushBuffer *pushBuffer, const TextureDesc &desc, VulkanDeviceAllocator *alloc)
 		: vulkan_(vulkan), mipLevels_(desc.mipLevels), format_(desc.format) {
-		bool result = Create(cmd, desc, alloc);
-		assert(result);
+		bool result = Create(cmd, pushBuffer, desc, alloc);
+		_assert_(result);
 	}
 
 	~VKTexture() {
@@ -325,9 +314,7 @@ public:
 	VkImageView GetImageView() { return vkTex_->GetImageView(); }
 
 private:
-	void SetImageData(VkCommandBuffer cmd, int x, int y, int z, int width, int height, int depth, int level, int stride, const uint8_t *data);
-
-	bool Create(VkCommandBuffer cmd, const TextureDesc &desc, VulkanDeviceAllocator *alloc);
+	bool Create(VkCommandBuffer cmd, VulkanPushBuffer *pushBuffer, const TextureDesc &desc, VulkanDeviceAllocator *alloc);
 
 	void Destroy() {
 		if (vkTex_) {
@@ -428,19 +415,21 @@ public:
 
 	// From Sascha's code
 	static std::string FormatDriverVersion(const VkPhysicalDeviceProperties &props) {
-		uint32_t major = (props.driverVersion >> 22) & 0x3ff;
-		uint32_t minor = (props.driverVersion >> 14) & 0x0ff;
 		if (props.vendorID == 4318) {
 			// 10 bits = major version (up to r1023)
 			// 8 bits = minor version (up to 255)
 			// 8 bits = secondary branch version/build version (up to 255)
 			// 6 bits = tertiary branch/build version (up to 63)
+			uint32_t major = (props.driverVersion >> 22) & 0x3ff;
+			uint32_t minor = (props.driverVersion >> 14) & 0x0ff;
 			uint32_t secondaryBranch = (props.driverVersion >> 6) & 0x0ff;
 			uint32_t tertiaryBranch = (props.driverVersion) & 0x003f;
 			return StringFromFormat("%d.%d.%d.%d (%08x)", major, minor, secondaryBranch, tertiaryBranch, props.driverVersion);
 		} else {
-			uint32_t branch = props.driverVersion & 0xfff;
-			minor = (props.driverVersion >> 12) & 0x0ff;
+			// Standard scheme, use the standard macros.
+			uint32_t major = VK_VERSION_MAJOR(props.driverVersion);
+			uint32_t minor = VK_VERSION_MINOR(props.driverVersion);
+			uint32_t branch = VK_VERSION_PATCH(props.driverVersion);
 			return StringFromFormat("%d.%d.%d (%08x)", major, minor, branch, props.driverVersion);
 		}
 	}
@@ -471,7 +460,7 @@ public:
 		switch (obj) {
 		case NativeObject::FRAMEBUFFER_RENDERPASS:
 			// Return a representative renderpass.
-			return (uintptr_t)renderManager_.GetRenderPass(0);
+			return (uintptr_t)renderManager_.GetRenderPass(VKRRenderPassAction::CLEAR, VKRRenderPassAction::CLEAR, VKRRenderPassAction::CLEAR);
 		case NativeObject::BACKBUFFER_RENDERPASS:
 			return (uintptr_t)renderManager_.GetBackbufferRenderPass();
 		case NativeObject::COMPATIBLE_RENDERPASS:
@@ -602,7 +591,7 @@ VkFormat DataFormatToVulkan(DataFormat format) {
 	}
 }
 
-inline VkSamplerAddressMode AddressModeToVulkan(Draw::TextureAddressMode mode) {
+static inline VkSamplerAddressMode AddressModeToVulkan(Draw::TextureAddressMode mode) {
 	switch (mode) {
 	case TextureAddressMode::CLAMP_TO_BORDER: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
 	case TextureAddressMode::CLAMP_TO_EDGE: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
@@ -659,21 +648,48 @@ enum class TextureState {
 	PENDING_DESTRUCTION,
 };
 
-bool VKTexture::Create(VkCommandBuffer cmd, const TextureDesc &desc, VulkanDeviceAllocator *alloc) {
+bool VKTexture::Create(VkCommandBuffer cmd, VulkanPushBuffer *push, const TextureDesc &desc, VulkanDeviceAllocator *alloc) {
 	// Zero-sized textures not allowed.
-	if (desc.width * desc.height * desc.depth == 0)
-		return false;
+	_assert_(desc.width * desc.height * desc.depth > 0);  // remember to set depth to 1!
+	_assert_(push);
 	format_ = desc.format;
 	mipLevels_ = desc.mipLevels;
 	width_ = desc.width;
 	height_ = desc.height;
 	depth_ = desc.depth;
 	vkTex_ = new VulkanTexture(vulkan_, alloc);
+	VkFormat vulkanFormat = DataFormatToVulkan(format_);
+	int stride = desc.width * (int)DataFormatSizeInBytes(format_);
+	int bpp = GetBpp(vulkanFormat);
+	int bytesPerPixel = bpp / 8;
+	int usageBits = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+	if (mipLevels_ > (int)desc.initData.size()) {
+		// Gonna have to generate some, which requires TRANSFER_SRC
+		usageBits |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+	}
+	if (!vkTex_->CreateDirect(cmd, width_, height_, mipLevels_, vulkanFormat, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, usageBits)) {
+		ELOG("Failed to create VulkanTexture: %dx%dx%d fmt %d, %d levels", width_, height_, depth_, (int)vulkanFormat, mipLevels_);
+		return false;
+	}
 	if (desc.initData.size()) {
-		for (int i = 0; i < (int)desc.initData.size(); i++) {
-			this->SetImageData(cmd, 0, 0, 0, width_, height_, depth_, i, 0, desc.initData[i]);
+		int w = width_;
+		int h = height_;
+		int i;
+		for (i = 0; i < (int)desc.initData.size(); i++) {
+			uint32_t offset;
+			VkBuffer buf;
+			size_t size = w * h * bytesPerPixel;
+			offset = push->PushAligned((const void *)desc.initData[i], size, 16, &buf);
+			vkTex_->UploadMip(cmd, i, w, h, buf, offset, w);
+			w = (w + 1) / 2;
+			h = (h + 1) / 2;
+		}
+		// Generate the rest of the mips automatically.
+		for (; i < mipLevels_; i++) {
+			vkTex_->GenerateMip(cmd, i);
 		}
 	}
+	vkTex_->EndCreate(cmd, false);
 	return true;
 }
 
@@ -713,13 +729,13 @@ VKContext::VKContext(VulkanContext *vulkan, bool splitSubmit)
 	dpTypes[1].descriptorCount = 200;
 	dpTypes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 
-	VkDescriptorPoolCreateInfo dp = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+	VkDescriptorPoolCreateInfo dp{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
 	dp.flags = 0;   // Don't want to mess around with individually freeing these, let's go dynamic each frame.
 	dp.maxSets = 200;  // 200 textures per frame should be enough for the UI...
 	dp.pPoolSizes = dpTypes;
 	dp.poolSizeCount = ARRAY_SIZE(dpTypes);
 
-	VkCommandPoolCreateInfo p = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+	VkCommandPoolCreateInfo p{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
 	p.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
 	p.queueFamilyIndex = vulkan->GetGraphicsQueueFamilyIndex();
 
@@ -757,7 +773,9 @@ VKContext::VKContext(VulkanContext *vulkan, bool splitSubmit)
 	res = vkCreatePipelineLayout(device_, &pl, nullptr, &pipelineLayout_);
 	assert(VK_SUCCESS == res);
 
-	pipelineCache_ = vulkan_->CreatePipelineCache();
+	VkPipelineCacheCreateInfo pc{ VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
+	res = vkCreatePipelineCache(vulkan_->GetDevice(), &pc, nullptr, &pipelineCache_);
+	assert(VK_SUCCESS == res);
 
 	renderManager_.SetSplitSubmit(splitSubmit);
 
@@ -788,6 +806,7 @@ void VKContext::BeginFrame() {
 	// OK, we now know that nothing is reading from this frame's data pushbuffer,
 	push_->Reset();
 	push_->Begin(vulkan_);
+	allocator_->Begin();
 
 	frame.descSets_.clear();
 	VkResult result = vkResetDescriptorPool(device_, frame.descriptorPool, 0);
@@ -801,6 +820,7 @@ void VKContext::WaitRenderCompletion(Framebuffer *fbo) {
 void VKContext::EndFrame() {
 	// Stop collecting data in the frame's data pushbuffer.
 	push_->End();
+	allocator_->End();
 
 	renderManager_.Finish();
 
@@ -841,7 +861,11 @@ VkDescriptorSet VKContext::GetOrCreateDescriptorSet(VkBuffer buf) {
 	VkDescriptorImageInfo imageDesc;
 	imageDesc.imageView = boundTextures_[0]->GetImageView();
 	imageDesc.sampler = boundSamplers_[0]->GetSampler();
+#ifdef VULKAN_USE_GENERAL_LAYOUT_FOR_COLOR
+	imageDesc.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+#else
 	imageDesc.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+#endif
 
 	VkWriteDescriptorSet writes[2] = {};
 	writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -1002,26 +1026,16 @@ InputLayout *VKContext::CreateInputLayout(const InputLayoutDesc &desc) {
 }
 
 Texture *VKContext::CreateTexture(const TextureDesc &desc) {
-	return new VKTexture(vulkan_, renderManager_.GetInitCmd(), desc, allocator_);
+	if (!push_) {
+		// Too early! Fail.
+		ELOG("Can't create textures before the first frame has started.");
+		return nullptr;
+	}
+	_assert_(renderManager_.GetInitCmd());
+	return new VKTexture(vulkan_, renderManager_.GetInitCmd(), push_, desc, allocator_);
 }
 
-void VKTexture::SetImageData(VkCommandBuffer cmd, int x, int y, int z, int width, int height, int depth, int level, int stride, const uint8_t *data) {
-	VkFormat vulkanFormat = DataFormatToVulkan(format_);
-	if (stride == 0) {
-		stride = width * (int)DataFormatSizeInBytes(format_);
-	}
-	int bpp = GetBpp(vulkanFormat);
-	int bytesPerPixel = bpp / 8;
-	vkTex_->Create(width, height, vulkanFormat);
-	int rowPitch;
-	uint8_t *dstData = vkTex_->Lock(0, &rowPitch);
-	for (int y = 0; y < height; y++) {
-		memcpy(dstData + rowPitch * y, data + stride * y, width * bytesPerPixel);
-	}
-	vkTex_->Unlock(cmd);
-}
-
-inline void CopySide(VkStencilOpState &dest, const StencilSide &src) {
+static inline void CopySide(VkStencilOpState &dest, const StencilSide &src) {
 	dest.compareMask = src.compareMask;
 	dest.reference = src.reference;
 	dest.writeMask = src.writeMask;
@@ -1118,24 +1132,6 @@ int VKPipeline::GetUniformLoc(const char *name) {
 	}
 
 	return loc;
-}
-
-inline VkPrimitiveTopology PrimToVK(Primitive prim) {
-	switch (prim) {
-	case Primitive::POINT_LIST: return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
-	case Primitive::LINE_LIST: return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
-	case Primitive::LINE_LIST_ADJ: return VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY;
-	case Primitive::LINE_STRIP: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
-	case Primitive::LINE_STRIP_ADJ: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY;
-	case Primitive::TRIANGLE_LIST: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-	case Primitive::TRIANGLE_LIST_ADJ: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY;
-	case Primitive::TRIANGLE_STRIP: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
-	case Primitive::TRIANGLE_STRIP_ADJ: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY;
-	case Primitive::TRIANGLE_FAN: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
-	case Primitive::PATCH_LIST: return VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
-	default:
-		return VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
-	}
 }
 
 void VKContext::UpdateDynamicUniformBuffer(const void *ub, size_t size) {
@@ -1320,7 +1316,7 @@ private:
 
 Framebuffer *VKContext::CreateFramebuffer(const FramebufferDesc &desc) {
 	VkCommandBuffer cmd = renderManager_.GetInitCmd();
-	VKRFramebuffer *vkrfb = new VKRFramebuffer(vulkan_, cmd, renderManager_.GetRenderPass(0), desc.width, desc.height);
+	VKRFramebuffer *vkrfb = new VKRFramebuffer(vulkan_, cmd, renderManager_.GetRenderPass(VKRRenderPassAction::CLEAR, VKRRenderPassAction::CLEAR, VKRRenderPassAction::CLEAR), desc.width, desc.height);
 	return new VKFramebuffer(vkrfb);
 }
 
@@ -1364,8 +1360,9 @@ void VKContext::BindFramebufferAsRenderTarget(Framebuffer *fbo, const RenderPass
 	VKFramebuffer *fb = (VKFramebuffer *)fbo;
 	VKRRenderPassAction color = (VKRRenderPassAction)rp.color;
 	VKRRenderPassAction depth = (VKRRenderPassAction)rp.depth;
+	VKRRenderPassAction stencil = (VKRRenderPassAction)rp.stencil;
 
-	renderManager_.BindFramebufferAsRenderTarget(fb ? fb->GetFB() : nullptr, color, depth, rp.clearColor, rp.clearDepth, rp.clearStencil);
+	renderManager_.BindFramebufferAsRenderTarget(fb ? fb->GetFB() : nullptr, color, depth, stencil, rp.clearColor, rp.clearDepth, rp.clearStencil);
 	curFramebuffer_ = fb;
 }
 

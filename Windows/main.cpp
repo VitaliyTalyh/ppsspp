@@ -349,6 +349,8 @@ std::vector<std::wstring> GetWideCmdLine() {
 	wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
 
 	std::vector<std::wstring> wideArgs(wargv, wargv + wargc);
+	LocalFree(wargv);
+
 	return wideArgs;
 }
 
@@ -389,10 +391,10 @@ int WINAPI WinMain(HINSTANCE _hInstance, HINSTANCE hPrevInstance, LPSTR szCmdLin
 	langRegion = GetDefaultLangRegion();
 	osName = GetWindowsVersion() + " " + GetWindowsSystemArchitecture();
 
-	char configFilename[MAX_PATH] = { 0 };
+	std::string configFilename = "";
 	const std::wstring configOption = L"--config=";
 
-	char controlsConfigFilename[MAX_PATH] = { 0 };
+	std::string controlsConfigFilename = "";
 	const std::wstring controlsOption = L"--controlconfig=";
 
 	std::vector<std::wstring> wideArgs = GetWideCmdLine();
@@ -403,14 +405,12 @@ int WINAPI WinMain(HINSTANCE _hInstance, HINSTANCE hPrevInstance, LPSTR szCmdLin
 		if (wideArgs[i][0] == L'-') {
 			if (wideArgs[i].find(configOption) != std::wstring::npos && wideArgs[i].size() > configOption.size()) {
 				const std::wstring tempWide = wideArgs[i].substr(configOption.size());
-				const std::string tempStr = ConvertWStringToUTF8(tempWide);
-				std::strncpy(configFilename, tempStr.c_str(), MAX_PATH);
+				configFilename = ConvertWStringToUTF8(tempWide);
 			}
 
 			if (wideArgs[i].find(controlsOption) != std::wstring::npos && wideArgs[i].size() > controlsOption.size()) {
 				const std::wstring tempWide = wideArgs[i].substr(controlsOption.size());
-				const std::string tempStr = ConvertWStringToUTF8(tempWide);
-				std::strncpy(controlsConfigFilename, tempStr.c_str(), MAX_PATH);
+				controlsConfigFilename = ConvertWStringToUTF8(tempWide);
 			}
 		}
 	}
@@ -426,7 +426,7 @@ int WINAPI WinMain(HINSTANCE _hInstance, HINSTANCE hPrevInstance, LPSTR szCmdLin
 	g_Config.AddSearchPath("");
 	g_Config.AddSearchPath(GetSysDirectory(DIRECTORY_SYSTEM));
 	g_Config.SetDefaultPath(GetSysDirectory(DIRECTORY_SYSTEM));
-	g_Config.Load(configFilename, controlsConfigFilename);
+	g_Config.Load(configFilename.c_str(), controlsConfigFilename.c_str());
 
 	bool debugLogLevel = false;
 
@@ -466,19 +466,19 @@ int WINAPI WinMain(HINSTANCE _hInstance, HINSTANCE hPrevInstance, LPSTR szCmdLin
 				// such as "software-gles", "software-d3d9", and "software-d3d11", or something similar.
 				// For now, software rendering force-activates OpenGL.
 				if (restOfOption == L"directx9") {
-					g_Config.iGPUBackend = GPU_BACKEND_DIRECT3D9;
+					g_Config.iGPUBackend = (int)GPUBackend::DIRECT3D9;
 					g_Config.bSoftwareRendering = false;
 				} else if (restOfOption == L"directx11") {
-					g_Config.iGPUBackend = GPU_BACKEND_DIRECT3D11;
+					g_Config.iGPUBackend = (int)GPUBackend::DIRECT3D11;
 					g_Config.bSoftwareRendering = false;
 				} else if (restOfOption == L"gles") {
-					g_Config.iGPUBackend = GPU_BACKEND_OPENGL;
+					g_Config.iGPUBackend = (int)GPUBackend::OPENGL;
 					g_Config.bSoftwareRendering = false;
 				} else if (restOfOption == L"vulkan") {
-					g_Config.iGPUBackend = GPU_BACKEND_VULKAN;
+					g_Config.iGPUBackend = (int)GPUBackend::VULKAN;
 					g_Config.bSoftwareRendering = false;
 				} else if (restOfOption == L"software") {
-					g_Config.iGPUBackend = GPU_BACKEND_OPENGL;
+					g_Config.iGPUBackend = (int)GPUBackend::OPENGL;
 					g_Config.bSoftwareRendering = true;
 				}
 			}
@@ -529,8 +529,10 @@ int WINAPI WinMain(HINSTANCE _hInstance, HINSTANCE hPrevInstance, LPSTR szCmdLin
 		MainWindow::Minimize();
 	}
 
-	// Emu thread is always running!
-	EmuThread_Start();
+	// Emu thread (and render thread, if any) is always running!
+	// Only OpenGL uses an externally managed render thread (due to GL's single-threaded context design). Vulkan
+	// manages its own render thread.
+	MainThread_Start(g_Config.iGPUBackend == (int)GPUBackend::OPENGL);
 	InputDevice::BeginPolling();
 
 	HACCEL hAccelTable = LoadAccelerators(_hInstance, (LPCTSTR)IDR_ACCELS);
@@ -569,10 +571,8 @@ int WINAPI WinMain(HINSTANCE _hInstance, HINSTANCE hPrevInstance, LPSTR szCmdLin
 			break;
 		}
 
-		if (!TranslateAccelerator(wnd, accel, &msg))
-		{
-			if (!DialogManager::IsDialogMessage(&msg))
-			{
+		if (!TranslateAccelerator(wnd, accel, &msg)) {
+			if (!DialogManager::IsDialogMessage(&msg)) {
 				//and finally translate and dispatch
 				TranslateMessage(&msg);
 				DispatchMessage(&msg);
@@ -580,12 +580,11 @@ int WINAPI WinMain(HINSTANCE _hInstance, HINSTANCE hPrevInstance, LPSTR szCmdLin
 		}
 	}
 
+	MainThread_Stop();
+
 	VFSShutdown();
 
 	InputDevice::StopPolling();
-
-	// The emuthread calls NativeShutdown when shutting down.
-	EmuThread_Stop();
 
 	MainWindow::DestroyDebugWindows();
 	DialogManager::DestroyAll();

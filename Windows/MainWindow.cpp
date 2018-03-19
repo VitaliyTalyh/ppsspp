@@ -116,6 +116,7 @@ namespace MainWindow
 	static bool g_IgnoreWM_SIZE = false;
 	static bool inFullscreenResize = false;
 	static bool inResizeMove = false;
+	static bool hasFocus = true;
 
 	// gross hack
 	bool noFocusPause = false;	// TOGGLE_PAUSE state to override pause on lost focus
@@ -262,8 +263,6 @@ namespace MainWindow
 		// Moves the internal display window to match the inner size of the main window.
 		MoveWindow(hwndDisplay, 0, 0, width, height, TRUE);
 
-		INFO_LOG(SYSTEM, "New width/height: %dx%d", width, height);
-
 		// Setting pixelWidth to be too small could have odd consequences.
 		if (width >= 4 && height >= 4) {
 			// The framebuffer manager reads these once per frame, hopefully safe enough.. should really use a mutex or some
@@ -272,14 +271,10 @@ namespace MainWindow
 			PSP_CoreParameter().pixelHeight = height;
 		}
 
-		INFO_LOG(SYSTEM, "Pixel width/height: %dx%d", PSP_CoreParameter().pixelWidth, PSP_CoreParameter().pixelHeight);
+		DEBUG_LOG(SYSTEM, "Pixel width/height: %dx%d", PSP_CoreParameter().pixelWidth, PSP_CoreParameter().pixelHeight);
 
 		if (UpdateScreenScale(width, height)) {
 			NativeMessageReceived("gpu_resized", "");
-		}
-
-		if (screenManager) {
-			screenManager->RecreateAllViews();
 		}
 
 		// Don't save the window state if fullscreen.
@@ -379,6 +374,7 @@ namespace MainWindow
 
 	void Minimize() {
 		ShowWindow(hwndMain, SW_MINIMIZE);
+		InputDevice::LoseFocus();
 	}
 
 	RECT DetermineWindowRectangle() {
@@ -688,7 +684,9 @@ namespace MainWindow
 				bool pause = true;
 				if (wParam == WA_ACTIVE || wParam == WA_CLICKACTIVE) {
 					WindowsRawInput::GainFocus();
-					InputDevice::GainFocus();
+					if (!IsIconic(GetHWND())) {
+						InputDevice::GainFocus();
+					}
 					g_activeWindow = WINDOW_MAINWINDOW;
 					pause = false;
 				}
@@ -701,14 +699,16 @@ namespace MainWindow
 					}
 				}
 
-				if (wParam == WA_ACTIVE) {
+				if (wParam == WA_ACTIVE || wParam == WA_CLICKACTIVE) {
 					NativeMessageReceived("got_focus", "");
+					hasFocus = true;
 					trapMouse = true;
 				}
 				if (wParam == WA_INACTIVE) {
 					NativeMessageReceived("lost_focus", "");
 					WindowsRawInput::LoseFocus();
 					InputDevice::LoseFocus();
+					hasFocus = false;
 					trapMouse = false;
 				}
 			}
@@ -740,6 +740,9 @@ namespace MainWindow
 				} else if (!inResizeMove) {
 					HandleSizeChange(wParam);
 				}
+				if (hasFocus) {
+					InputDevice::GainFocus();
+				}
 				break;
 
 			case SIZE_MINIMIZED:
@@ -747,6 +750,7 @@ namespace MainWindow
 				if (!g_Config.bPauseWhenMinimized) {
 					NativeMessageReceived("window minimized", "true");
 				}
+				InputDevice::LoseFocus();
 				break;
 			default:
 				break;
@@ -789,7 +793,7 @@ namespace MainWindow
 
 		case WM_COMMAND:
 			{
-				if (!EmuThread_Ready())
+				if (!MainThread_Ready())
 					return DefWindowProc(hWnd, message, wParam, lParam);
 
 				MainWindowMenu_Process(hWnd, wParam);
@@ -838,7 +842,7 @@ namespace MainWindow
 
 		case WM_DROPFILES:
 			{
-				if (!EmuThread_Ready())
+				if (!MainThread_Ready())
 					return DefWindowProc(hWnd, message, wParam, lParam);
 
 				HDROP hdrop = (HDROP)wParam;
@@ -860,9 +864,7 @@ namespace MainWindow
 
 		case WM_CLOSE:
 			InputDevice::StopPolling();
-			EmuThread_Stop();
 			WindowsRawInput::Shutdown();
-
 			return DefWindowProc(hWnd,message,wParam,lParam);
 
 		case WM_DESTROY:
@@ -908,10 +910,10 @@ namespace MainWindow
 		case WM_USER_RESTART_EMUTHREAD:
 			NativeSetRestarting();
 			InputDevice::StopPolling();
-			EmuThread_Stop();
+			MainThread_Stop();
 			coreState = CORE_POWERUP;
 			ResetUIState();
-			EmuThread_Start();
+			MainThread_Start(g_Config.iGPUBackend == (int)GPUBackend::OPENGL);
 			InputDevice::BeginPolling();
 			break;
 

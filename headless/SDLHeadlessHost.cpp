@@ -20,7 +20,6 @@
 #include <stdio.h>
 #include <SDL.h>
 #include <cassert>
-#include "gfx/gl_lost_manager.h"
 
 #include "headless/SDLHeadlessHost.h"
 
@@ -37,6 +36,7 @@
 #include "gfx_es2/gpu_features.h"
 #include "file/vfs.h"
 #include "file/zip_read.h"
+#include "thin3d/thin3d_create.h"
 
 const bool WINDOW_VISIBLE = false;
 const int WINDOW_WIDTH = 480;
@@ -55,6 +55,7 @@ public:
 	GLDummyGraphicsContext() {
 		CheckGLExtensions();
 		draw_ = Draw::T3DCreateGLContext();
+		SetGPUBackend(GPUBackend::OPENGL);
 		bool success = draw_->CreatePresets();
 		assert(success);
 	}
@@ -114,8 +115,6 @@ bool SDLHeadlessHost::InitGraphics(std::string *error_message, GraphicsContext *
 	}
 #endif
 
-	gl_lost_manager_init();
-
 	GraphicsContext *graphicsContext = new GLDummyGraphicsContext();
 	*ctx = graphicsContext;
 	gfx_ = graphicsContext;
@@ -134,8 +133,6 @@ void SDLHeadlessHost::ShutdownGraphics() {
 	glContext_ = nullptr;
 	SDL_DestroyWindow(screen_);
 	screen_ = nullptr;
-
-	gl_lost_manager_shutdown();
 }
 
 void SDLHeadlessHost::SwapBuffers() {

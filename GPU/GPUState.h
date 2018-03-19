@@ -441,12 +441,6 @@ struct GPUgstate {
 	void Restore(u32_le *ptr);
 };
 
-bool vertTypeIsSkinningEnabled(u32 vertType);
-
-inline int vertTypeGetNumBoneWeights(u32 vertType) { return 1 + ((vertType & GE_VTYPE_WEIGHTCOUNT_MASK) >> GE_VTYPE_WEIGHTCOUNT_SHIFT); }
-inline int vertTypeGetWeightMask(u32 vertType) { return vertType & GE_VTYPE_WEIGHT_MASK; }
-inline int vertTypeGetTexCoordMask(u32 vertType) { return vertType & GE_VTYPE_TC_MASK; }
-
 // The rest is cached simplified/converted data for fast access.
 // Does not need to be saved when saving/restoring context.
 //
@@ -477,6 +471,7 @@ enum {
 	GPU_SUPPORTS_VERTEX_TEXTURE_FETCH = FLAG_BIT(11),
 	GPU_SUPPORTS_TEXTURE_FLOAT = FLAG_BIT(12),
 	GPU_SUPPORTS_16BIT_FORMATS = FLAG_BIT(13),
+	GPU_SUPPORTS_DEPTH_CLAMP = FLAG_BIT(14),
 	GPU_SUPPORTS_LARGE_VIEWPORTS = FLAG_BIT(16),
 	GPU_SUPPORTS_ACCURATE_DEPTH = FLAG_BIT(17),
 	GPU_SUPPORTS_VAO = FLAG_BIT(18),
@@ -490,7 +485,6 @@ enum {
 	GPU_SUPPORTS_ARB_FRAMEBUFFER_BLIT = FLAG_BIT(26),
 	GPU_SUPPORTS_NV_FRAMEBUFFER_BLIT = FLAG_BIT(27),
 	GPU_SUPPORTS_OES_TEXTURE_NPOT = FLAG_BIT(28),
-	GPU_IS_MOBILE = FLAG_BIT(29),
 	GPU_PREFER_CPU_DOWNLOAD = FLAG_BIT(30),
 	GPU_PREFER_REVERSE_COLOR_ORDER = FLAG_BIT(31),
 };
@@ -528,6 +522,8 @@ struct GPUStateCache {
 		if (need != needShaderTexClamp) {
 			needShaderTexClamp = need;
 			Dirty(DIRTY_FRAGMENTSHADER_STATE);
+			if (need)
+				Dirty(DIRTY_TEXCLAMP);
 		}
 	}
 	void SetAllowShaderBlend(bool allow) {
@@ -557,7 +553,6 @@ struct GPUStateCache {
 	bool allowShaderBlend;
 
 	float morphWeights[8];
-	u32 deferredVertTypeDirty;
 
 	u32 curTextureWidth;
 	u32 curTextureHeight;

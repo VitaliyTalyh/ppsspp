@@ -48,14 +48,13 @@
 #include "Common/KeyMap.h"
 #include "Common/FileUtil.h"
 #include "Common/OSVersion.h"
-#include "Common/Vulkan/VulkanLoader.h"
 #include "Core/Config.h"
 #include "Core/Host.h"
 #include "Core/System.h"
 #include "Core/Reporting.h"
 #include "android/jni/TestRunner.h"
 #include "GPU/GPUInterface.h"
-#include "GPU/GLES/FramebufferManagerGLES.h"
+#include "GPU/Common/FramebufferCommon.h"
 
 #if defined(_WIN32) && !PPSSPP_PLATFORM(UWP)
 #pragma warning(disable:4091)  // workaround bug in VS2015 headers
@@ -64,14 +63,7 @@
 #include "Windows/W32Util/ShellUtil.h"
 #endif
 
-#if !PPSSPP_PLATFORM(UWP)
-#include "gfx/gl_common.h"
-#endif
-
-#ifdef IOS
-extern bool iosCanUseJit;
-extern bool targetIsJailbroken;
-#endif
+extern bool VulkanMayBeAvailable();
 
 GameSettingsScreen::GameSettingsScreen(std::string gamePath, std::string gameID, bool editThenRestore)
 	: UIDialogScreenWithGameBackground(gamePath), gameID_(gameID), enableReports_(false), editThenRestore_(editThenRestore) {
@@ -89,8 +81,7 @@ bool CheckSupportInstancedTessellationGLES() {
 	return true;
 #else
 	// TODO: Make work with non-GL backends
-	int maxVertexTextureImageUnits;
-	glGetIntegerv(GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS, &maxVertexTextureImageUnits);
+	int maxVertexTextureImageUnits = gl_extensions.maxVertexTextureUnits;
 	bool vertexTexture = maxVertexTextureImageUnits >= 3; // At least 3 for hardware tessellation
 
 	bool canUseInstanceID = gl_extensions.EXT_draw_instanced || gl_extensions.ARB_draw_instanced;
@@ -98,17 +89,18 @@ bool CheckSupportInstancedTessellationGLES() {
 	bool instanceRendering = gl_extensions.GLES3 || (canUseInstanceID && canDefInstanceID);
 
 	bool textureFloat = gl_extensions.ARB_texture_float || gl_extensions.OES_texture_float;
+	bool hasTexelFetch = gl_extensions.GLES3 || (!gl_extensions.IsGLES && gl_extensions.VersionGEThan(3, 3, 0)) || gl_extensions.EXT_gpu_shader4;
 
-	return instanceRendering && vertexTexture && textureFloat;
+	return instanceRendering && vertexTexture && textureFloat && hasTexelFetch;
 #endif
 }
 
-bool IsBackendSupportHWTess() {
-	switch (g_Config.iGPUBackend) {
-	case GPU_BACKEND_OPENGL:
+bool DoesBackendSupportHWTess() {
+	switch (GetGPUBackend()) {
+	case GPUBackend::OPENGL:
 		return CheckSupportInstancedTessellationGLES();
-	case GPU_BACKEND_VULKAN:
-	case GPU_BACKEND_DIRECT3D11:
+	case GPUBackend::VULKAN:
+	case GPUBackend::DIRECT3D11:
 		return true;
 	}
 	return false;
@@ -178,7 +170,7 @@ void GameSettingsScreen::CreateViews() {
 
 	graphicsSettings->Add(new ItemHeader(gr->T("Rendering Mode")));
 	static const char *renderingBackend[] = { "OpenGL", "Direct3D 9", "Direct3D 11", "Vulkan" };
-	PopupMultiChoice *renderingBackendChoice = graphicsSettings->Add(new PopupMultiChoice(&g_Config.iGPUBackend, gr->T("Backend"), renderingBackend, GPU_BACKEND_OPENGL, ARRAY_SIZE(renderingBackend), gr->GetName(), screenManager()));
+	PopupMultiChoice *renderingBackendChoice = graphicsSettings->Add(new PopupMultiChoice(&g_Config.iGPUBackend, gr->T("Backend"), renderingBackend, (int)GPUBackend::OPENGL, ARRAY_SIZE(renderingBackend), gr->GetName(), screenManager()));
 	renderingBackendChoice->OnChoice.Handle(this, &GameSettingsScreen::OnRenderingBackend);
 #if !PPSSPP_PLATFORM(WINDOWS)
 	renderingBackendChoice->HideChoice(1);  // D3D9
@@ -190,27 +182,21 @@ void GameSettingsScreen::CreateViews() {
 	}
 #endif
 	bool vulkanAvailable = false;
-#if PPSSPP_PLATFORM(WINDOWS) || PPSSPP_PLATFORM(ANDROID)
+#ifndef IOS
 	vulkanAvailable = VulkanMayBeAvailable();
 #endif
 	if (!vulkanAvailable) {
 		renderingBackendChoice->HideChoice(3);
 	}
 
-	static const char *renderingMode[] = { "Non-Buffered Rendering", "Buffered Rendering", "Read Framebuffers To Memory (CPU)", "Read Framebuffers To Memory (GPU)"};
+	static const char *renderingMode[] = { "Non-Buffered Rendering", "Buffered Rendering"};
 	PopupMultiChoice *renderingModeChoice = graphicsSettings->Add(new PopupMultiChoice(&g_Config.iRenderingMode, gr->T("Mode"), renderingMode, 0, ARRAY_SIZE(renderingMode), gr->GetName(), screenManager()));
 	renderingModeChoice->OnChoice.Add([=](EventParams &e) {
 		switch (g_Config.iRenderingMode) {
 		case FB_NON_BUFFERED_MODE:
-			settingInfo_->Show(gr->T("RenderingMode NonBuffered Tip", "Faster, but nothing may draw in some games"), e.v);
+			settingInfo_->Show(gr->T("RenderingMode NonBuffered Tip", "Faster, but graphics may be missing in some games"), e.v);
 			break;
 		case FB_BUFFERED_MODE:
-			break;
-#ifndef USING_GLES2
-		case FB_READFBOMEMORY_CPU:
-#endif
-		case FB_READFBOMEMORY_GPU:
-			settingInfo_->Show(gr->T("RenderingMode ReadFromMemory Tip", "Causes crashes in many games, not recommended"), e.v);
 			break;
 		}
 		return UI::EVENT_CONTINUE;
@@ -256,7 +242,7 @@ void GameSettingsScreen::CreateViews() {
 
 	graphicsSettings->Add(new ItemHeader(gr->T("Features")));
 	// Hide postprocess option on unsupported backends to avoid confusion.
-	if (g_Config.iGPUBackend != GPU_BACKEND_DIRECT3D9) {
+	if (GetGPUBackend() != GPUBackend::DIRECT3D9) {
 		I18NCategory *ps = GetI18NCategory("PostShaders");
 		postProcChoice_ = graphicsSettings->Add(new ChoiceWithValueDisplay(&g_Config.sPostShaderName, gr->T("Postprocessing Shader"), ps->GetName()));
 		postProcChoice_->OnClick.Handle(this, &GameSettingsScreen::OnPostProcShader);
@@ -312,13 +298,6 @@ void GameSettingsScreen::CreateViews() {
 	hwTransform->OnClick.Handle(this, &GameSettingsScreen::OnHardwareTransform);
 	hwTransform->SetDisabledPtr(&g_Config.bSoftwareRendering);
 
-	CheckBox *swSkin = graphicsSettings->Add(new CheckBox(&g_Config.bSoftwareSkinning, gr->T("Software Skinning")));
-	swSkin->OnClick.Add([=](EventParams &e) {
-		settingInfo_->Show(gr->T("SoftwareSkinning Tip", "Combine skinned model draws on the CPU, faster in most games"), e.v);
-		return UI::EVENT_CONTINUE;
-	});
-	swSkin->SetDisabledPtr(&g_Config.bSoftwareRendering);
-
 	CheckBox *vtxCache = graphicsSettings->Add(new CheckBox(&g_Config.bVertexCache, gr->T("Vertex Cache")));
 	vtxCache->OnClick.Add([=](EventParams &e) {
 		settingInfo_->Show(gr->T("VertexCache Tip", "Faster, but may cause temporary flicker"), e.v);
@@ -362,7 +341,7 @@ void GameSettingsScreen::CreateViews() {
 		settingInfo_->Show(gr->T("HardwareTessellation Tip", "Uses hardware to make curves, always uses a fixed quality"), e.v);
 		return UI::EVENT_CONTINUE;
 	});
-	tessHWEnable_ = IsBackendSupportHWTess() && !g_Config.bSoftwareRendering && g_Config.bHardwareTransform;
+	tessHWEnable_ = DoesBackendSupportHWTess() && !g_Config.bSoftwareRendering && g_Config.bHardwareTransform;
 	tessellationHW->SetEnabledPtr(&tessHWEnable_);
 
 	// In case we're going to add few other antialiasing option like MSAA in the future.
@@ -807,13 +786,13 @@ UI::EventReturn GameSettingsScreen::OnSoftwareRendering(UI::EventParams &e) {
 	postProcEnable_ = !g_Config.bSoftwareRendering && (g_Config.iRenderingMode != FB_NON_BUFFERED_MODE);
 	resolutionEnable_ = !g_Config.bSoftwareRendering && (g_Config.iRenderingMode != FB_NON_BUFFERED_MODE);
 	bloomHackEnable_ = !g_Config.bSoftwareRendering && (g_Config.iInternalResolution != 1);
-	tessHWEnable_ = IsBackendSupportHWTess() && !g_Config.bSoftwareRendering && g_Config.bHardwareTransform;
+	tessHWEnable_ = DoesBackendSupportHWTess() && !g_Config.bSoftwareRendering && g_Config.bHardwareTransform;
 	return UI::EVENT_DONE;
 }
 
 UI::EventReturn GameSettingsScreen::OnHardwareTransform(UI::EventParams &e) {
 	vtxCacheEnable_ = !g_Config.bSoftwareRendering && g_Config.bHardwareTransform;
-	tessHWEnable_ = IsBackendSupportHWTess() && !g_Config.bSoftwareRendering && g_Config.bHardwareTransform;
+	tessHWEnable_ = DoesBackendSupportHWTess() && !g_Config.bSoftwareRendering && g_Config.bHardwareTransform;
 	return UI::EVENT_DONE;
 }
 
@@ -1228,14 +1207,7 @@ void DeveloperToolsScreen::CreateViews() {
 	Choice *cpuTests = new Choice(dev->T("Run CPU Tests"));
 	list->Add(cpuTests)->OnClick.Handle(this, &DeveloperToolsScreen::OnRunCPUTests);
 
-#ifdef IOS
-	const std::string testDirectory = g_Config.flash0Directory + "../";
-#else
-	const std::string testDirectory = g_Config.memStickDirectory;
-#endif
-	if (!File::Exists(testDirectory + "pspautotests/tests/")) {
-		cpuTests->SetEnabled(false);
-	}
+	cpuTests->SetEnabled(TestsAvailable());
 #endif
 
 	list->Add(new CheckBox(&g_Config.bEnableLogging, dev->T("Enable Logging")))->OnClick.Handle(this, &DeveloperToolsScreen::OnLoggingChanged);

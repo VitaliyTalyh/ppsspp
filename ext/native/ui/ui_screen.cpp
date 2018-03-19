@@ -33,8 +33,9 @@ void UIScreen::DoRecreateViews() {
 		delete root_;
 		root_ = nullptr;
 		CreateViews();
-		if (root_ && root_->GetDefaultFocusView()) {
-			root_->GetDefaultFocusView()->SetFocus();
+		UI::View *defaultView = root_ ? root_->GetDefaultFocusView() : nullptr;
+		if (defaultView && defaultView->GetVisibility() == UI::V_VISIBLE) {
+			defaultView->SetFocus();
 		}
 		recreateViews_ = false;
 
@@ -67,8 +68,9 @@ void UIScreen::preRender() {
 		return;
 	}
 	draw->BeginFrame();
+	screenManager()->getUIContext()->BeginFrame();
 	// Bind and clear the back buffer
-	draw->BindFramebufferAsRenderTarget(nullptr, { RPAction::CLEAR, RPAction::CLEAR, 0xFF000000 });
+	draw->BindFramebufferAsRenderTarget(nullptr, { RPAction::CLEAR, RPAction::CLEAR, RPAction::CLEAR, 0xFF000000 });
 
 	Draw::Viewport viewport;
 	viewport.TopLeftX = 0;
@@ -307,6 +309,10 @@ void PopupScreen::TriggerFinish(DialogResult result) {
 	finishResult_ = result;
 
 	OnCompleted(result);
+}
+
+void PopupScreen::resized() {
+	RecreateViews();
 }
 
 void PopupScreen::CreateViews() {

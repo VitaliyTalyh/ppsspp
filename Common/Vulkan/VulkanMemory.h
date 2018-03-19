@@ -146,11 +146,12 @@ public:
 
 	static const size_t ALLOCATE_FAILED = -1;
 
-	int GetBlockCount() const { return (int)slabs_.size(); }
+	int GetSlabCount() const { return (int)slabs_.size(); }
 	int GetMinSlabSize() const { return (int)minSlabSize_; }
 	int GetMaxSlabSize() const { return (int)maxSlabSize_; }
 
 	int ComputeUsagePercent() const;
+	std::vector<uint8_t> GetSlabUsage(int slab) const;
 
 private:
 	static const size_t SLAB_GRAIN_SIZE = 1024;
@@ -180,7 +181,7 @@ private:
 
 	static void DispatchFree(void *userdata) {
 		auto freeInfo = static_cast<FreeInfo *>(userdata);
-		freeInfo->allocator->ExecuteFree(freeInfo);
+		freeInfo->allocator->ExecuteFree(freeInfo);  // this deletes freeInfo
 	}
 
 	bool AllocateSlab(VkDeviceSize minBytes);
@@ -190,9 +191,9 @@ private:
 
 	VulkanContext *const vulkan_;
 	std::vector<Slab> slabs_;
-	size_t lastSlab_;
+	size_t lastSlab_ = 0;
 	size_t minSlabSize_;
 	const size_t maxSlabSize_;
-	uint32_t memoryTypeIndex_;
-	bool destroyed_;
+	uint32_t memoryTypeIndex_ = UNDEFINED_MEMORY_TYPE;
+	bool destroyed_ = false;
 };

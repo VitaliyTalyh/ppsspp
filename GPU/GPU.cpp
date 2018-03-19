@@ -55,6 +55,12 @@ static void SetGPU(T *obj) {
 #undef new
 #endif
 
+bool GPU_IsReady() {
+	if (gpu)
+		return gpu->IsReady();
+	return false;
+}
+
 bool GPU_Init(GraphicsContext *ctx, Draw::DrawContext *draw) {
 #if PPSSPP_PLATFORM(UWP)
 	SetGPU(new GPU_D3D11(ctx, draw));
@@ -104,6 +110,6 @@ bool GPU_Init(GraphicsContext *ctx, Draw::DrawContext *draw) {
 
 void GPU_Shutdown() {
 	delete gpu;
-	gpu = 0;
+	gpu = nullptr;
 	gpuDebug = 0;
 }

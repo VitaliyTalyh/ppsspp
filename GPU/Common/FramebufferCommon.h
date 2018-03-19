@@ -40,15 +40,6 @@ enum {
 enum {
 	FB_NON_BUFFERED_MODE = 0,
 	FB_BUFFERED_MODE = 1,
-
-	// Hm, it's unfortunate that GPU has ended up as two separate values in GL and GLES.
-#ifndef USING_GLES2
-	FB_READFBOMEMORY_CPU = 2,
-	FB_READFBOMEMORY_GPU = 3,
-#else
-	FB_READFBOMEMORY_GPU = 2,
-#endif
-	FBO_READFBOMEMORY_MIN = 2
 };
 
 namespace Draw {
@@ -79,9 +70,10 @@ struct VirtualFramebuffer {
 	int last_frame_displayed;
 	int last_frame_clut;
 	int last_frame_failed;
+	int last_frame_depth_updated;
+	int last_frame_depth_render;
 	u32 clutUpdatedBytes;
 	bool memoryUpdated;
-	bool depthUpdated;
 	bool firstFrameSaved;
 
 	u32 fb_address;
@@ -158,6 +150,7 @@ enum DrawTextureFlags {
 	DRAWTEX_NEAREST = 0,
 	DRAWTEX_LINEAR = 1,
 	DRAWTEX_KEEP_TEX = 2,
+	DRAWTEX_KEEP_STENCIL_ALPHA = 4,
 };
 
 inline Draw::DataFormat GEFormatToThin3D(int geFormat) {
@@ -214,7 +207,7 @@ public:
 			return vfb;
 		}
 	}
-	virtual void RebindFramebuffer();
+	void RebindFramebuffer();
 	std::vector<FramebufferInfo> GetFramebufferList();
 
 	void CopyDisplayToOutput();
@@ -230,9 +223,9 @@ public:
 	bool NotifyBlockTransferBefore(u32 dstBasePtr, int dstStride, int dstX, int dstY, u32 srcBasePtr, int srcStride, int srcX, int srcY, int w, int h, int bpp, u32 skipDrawReason);
 	void NotifyBlockTransferAfter(u32 dstBasePtr, int dstStride, int dstX, int dstY, u32 srcBasePtr, int srcStride, int srcX, int srcY, int w, int h, int bpp, u32 skipDrawReason);
 
-	virtual void ReadFramebufferToMemory(VirtualFramebuffer *vfb, bool sync, int x, int y, int w, int h);
+	void ReadFramebufferToMemory(VirtualFramebuffer *vfb, bool sync, int x, int y, int w, int h);
 
-	virtual void DownloadFramebufferForClut(u32 fb_address, u32 loadBytes);
+	void DownloadFramebufferForClut(u32 fb_address, u32 loadBytes);
 	void DrawFramebufferToOutput(const u8 *srcPixels, GEBufferFormat srcPixelFormat, int srcStride, bool applyPostShader);
 
 	void DrawPixels(VirtualFramebuffer *vfb, int dstX, int dstY, const u8 *srcPixels, GEBufferFormat srcPixelFormat, int srcStride, int width, int height);
@@ -283,7 +276,8 @@ public:
 
 	void SetDepthUpdated() {
 		if (currentRenderVfb_) {
-			currentRenderVfb_->depthUpdated = true;
+			currentRenderVfb_->last_frame_depth_render = gpuStats.numFlips;
+			currentRenderVfb_->last_frame_depth_updated = gpuStats.numFlips;
 		}
 	}
 	void SetColorUpdated(int skipDrawReason) {
@@ -319,7 +313,6 @@ protected:
 	bool UpdateSize();
 	void SetNumExtraFBOs(int num);
 
-	virtual void DisableState() = 0;
 	void FlushBeforeCopy();
 	virtual void DecimateFBOs();  // keeping it virtual to let D3D do a little extra
 
@@ -383,7 +376,6 @@ protected:
 	u32 framebufRangeEnd_ = 0;
 
 	bool useBufferedRendering_ = false;
-	bool updateVRAM_ = false;
 	bool usePostShader_ = false;
 	bool postShaderAtOutputResolution_ = false;
 	bool postShaderIsUpscalingFilter_ = false;

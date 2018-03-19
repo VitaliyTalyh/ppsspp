@@ -71,6 +71,8 @@ static const uint32_t colors[4] = {
 
 static std::unique_ptr<ManagedTexture> bgTexture;
 
+static bool backgroundInited;
+
 void UIBackgroundInit(UIContext &dc) {
 	const std::string bgPng = GetSysDirectory(DIRECTORY_SYSTEM) + "background.png";
 	const std::string bgJpg = GetSysDirectory(DIRECTORY_SYSTEM) + "background.jpg";
@@ -82,9 +84,15 @@ void UIBackgroundInit(UIContext &dc) {
 
 void UIBackgroundShutdown() {
 	bgTexture.reset(nullptr);
+	backgroundInited = false;
 }
 
 void DrawBackground(UIContext &dc, float alpha) {
+	if (!backgroundInited) {
+		UIBackgroundInit(dc);
+		backgroundInited = true;
+	}
+
 	static float xbase[100] = {0};
 	static float ybase[100] = {0};
 	float xres = dc.GetBounds().w;
@@ -480,6 +488,7 @@ void LogoScreen::render() {
 	::DrawBackground(dc, alpha);
 
 	I18NCategory *cr = GetI18NCategory("PSPCredits");
+	I18NCategory *gr = GetI18NCategory("Graphics");
 	char temp[256];
 	// Manually formatting UTF-8 is fun.  \xXX doesn't work everywhere.
 	snprintf(temp, sizeof(temp), "%s Henrik Rydg%c%crd", cr->T("created", "Created by"), 0xC3, 0xA5);
@@ -500,7 +509,8 @@ void LogoScreen::render() {
 
 #if (defined(_WIN32) && !PPSSPP_PLATFORM(UWP)) || PPSSPP_PLATFORM(ANDROID)
 	// Draw the graphics API, except on UWP where it's always D3D11
-	dc.DrawText(screenManager()->getDrawContext()->GetInfoString(InfoField::APINAME).c_str(), bounds.centerX(), ppsspp_org_y + 50, textColor, ALIGN_CENTER);
+	std::string apiName = screenManager()->getDrawContext()->GetInfoString(InfoField::APINAME);
+	dc.DrawText(gr->T(apiName), bounds.centerX(), ppsspp_org_y + 50, textColor, ALIGN_CENTER);
 #endif
 
 	dc.End();
